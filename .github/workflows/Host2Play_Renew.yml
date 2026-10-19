@@ -1,31 +1,77 @@
 name: Host2Play 续期
 
 on:
+  # 调度全部用 UTC，北京时间 = UTC+8。
+  #
+  # 为什么改成"每小时一次"：
+  #   GitHub Actions 的 cron 在整点/半点高峰期会延迟 15~60 分钟，极端情况下整个
+  #   事件被丢弃（官方明确说明 schedule 不保证准时、高负载时会跳过）。原来的
+  #   `37 5,16` 一天只有两个点，一旦被延迟或丢弃，那个时段就没有任何替补 ——
+  #   这就是"中午那次定时器不工作"的直接原因。加密到每小时一次之后，单次被跳过
+  #   最多只影响一小时，下一小时自然会补上。
+  #
+  # 为什么每小时跑却不会每小时都续：
+  #   续不续期完全由 main.py 按"剩余时间"决定（SKIP_IF_REMAINING_HOURS），
+  #   调度只负责"多来看几眼"。剩余时间还多就直接跳过，连浏览器都不启动，
+  #   只花一次 getServerData 的 HTTP 请求（约 1 秒），不烧任何验证码额度。
+  #
+  # 分钟数选 17：避开 :00 / :30 这两个排队最严重的时刻，降低被延迟的概率。
   schedule:
-    - cron: '7 0,11,22 * * *'
-    - cron: '37 5,16 * * *'
+    - cron: '17 * * * *'
 
   workflow_dispatch:
     inputs:
       retry:
-        description: "Retry Count"
+        description: "Retry Count（内部使用，手动触发保持 0）"
         required: false
         default: "0"
+        type: string
 
 permissions:
   contents: write
-  actions: write   # ✅ 关键修复
+  actions: write
 
 concurrency:
   group: host2play-renew
   cancel-in-progress: false
+
+# ==============================================================================
+# 续期行为参数 —— 想改策略直接改这里，不用动脚本
+#
+#   SKIP_IF_REMAINING_HOURS:   核心开关。剩余时间超过这个小时数就跳过，不续期。
+#                              设 2 表示"只剩 1~2 小时才动手"。
+#                              为什么是这个值：续期一次通常加 24~72 小时，太早续
+#                              会把已有的时长浪费掉；而调度是每小时一次，剩余 2
+#                              小时意味着后面还有 2 次机会，即使某次被跳过也来得及。
+#                              注意下限：不要把这里设到 1 以下 —— GitHub cron 可能
+#                              延迟 30~60 分钟，剩余不足 1 小时时一次延迟就可能
+#                              让服务器真的过期。
+#
+#   RENEW_COOLDOWN_HOURS:      成功后多少小时内不再重复续期。防止同一天因为多次
+#                              调度触发而反复烧验证码额度。设 0 表示不冷却。
+#
+#   STALE_AFTER_HOURS:         兜底保险。超过这么多小时没有成功续期，就无视上面
+#                              两个阈值强制续一次。用于"调度连续被丢弃"的极端情况。
+#
+#   JOB_BUDGET_MINUTES:        整体时间预算（分钟）。超预算后不再开新 URL，
+#                              保证在 job 的 timeout-minutes 内收尾并提交状态。
+# ==============================================================================
+env:
+  SKIP_IF_REMAINING_HOURS: "2"
+  RENEW_COOLDOWN_HOURS: "6"
+  STALE_AFTER_HOURS: "30"
+  JOB_BUDGET_MINUTES: "20"
 
 jobs:
 
   run-renew:
     name: 执行脚本
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # 40 分钟 = JOB_BUDGET_MINUTES(20) + 装 Chrome/依赖/WARP（约 8-12 分钟）
+    #          + 提交状态与摘要的余量。
+    # 因为现在每小时跑一次，单次必须跑得快；设太大只会在排队时互相挤压。
+    # 真正需要续期时（剩 1~2 小时）单条 URL 约 1-3 分钟，20 分钟预算绰绰有余。
+    timeout-minutes: 40
 
     steps:
       - name: 拉取仓库
@@ -52,11 +98,40 @@ jobs:
             libxcursor1 libxdamage1 libxext6 libxfixes3 \
             libxi6 libxrandr2 libxrender1 libxss1 libxtst6 xdg-utils
 
-      - name: 安装 Google Chrome
+      # ---------- Chrome deb 缓存 -------------------------------------------------
+      # deb 包 ~110MB，每次重新下载要 20-40 秒且经常被 dl.google.com 限速。
+      # key 里带 UTC 日期：每天一个新 key，Chrome 会自然更新到当日最新版；
+      # restore-keys 用前缀兜底，所以跨天也几乎总能命中上一次的 deb（只有当
+      # 缓存被 LRU 淘汰或 key 前缀变化时才会真的重新下载）。
+      - name: 计算缓存 key（UTC 日期）
+        id: cache-date
+        run: echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: 缓存 Chrome deb
+        id: chrome-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/host2play/google-chrome.deb
+          key: google-chrome-deb-${{ runner.os }}-${{ steps.cache-date.outputs.date }}
+          restore-keys: |
+            google-chrome-deb-${{ runner.os }}-
+
+      - name: 安装 Google Chrome（缓存命中则跳过下载）
         run: |
-          wget -q -O /tmp/google-chrome.deb \
-            https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-          sudo dpkg -i /tmp/google-chrome.deb || sudo apt-get install -fy
+          set -euo pipefail
+          DEB="$HOME/.cache/host2play/google-chrome.deb"
+          if [ -s "$DEB" ]; then
+            echo "[INFO] 命中缓存，跳过下载：$(du -h "$DEB" | cut -f1)"
+          else
+            echo "[INFO] 缓存未命中，下载 Chrome deb"
+            mkdir -p "$(dirname "$DEB")"
+            curl -fsSL --retry 3 --retry-delay 5 \
+              -o "$DEB.part" \
+              https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+            mv "$DEB.part" "$DEB"
+            echo "[INFO] 下载完成：$(du -h "$DEB" | cut -f1)"
+          fi
+          sudo dpkg -i "$DEB" || sudo apt-get install -fy
           google-chrome --version
 
       - name: 安装 Python 依赖
@@ -70,7 +145,7 @@ jobs:
             SpeechRecognition pydub
 
       - name: 启用 WARP 网络
-        uses: fscarmen/warp-on-actions@v1.3
+        uses: fscarmen/warp-on-actions@v1.4
         with:
           stack: dual
           mode: client
@@ -86,12 +161,30 @@ jobs:
       - name: 创建输出目录
         run: mkdir -p output/screenshots
 
+      # 纯离线契约自测（不联网、不启浏览器）。放在跑浏览器之前：
+      # main.py 的纯函数契约（parse_expiry / should_skip / state schema）一旦漂移，
+      # 这里 2 秒就红，不用等 5 分钟浏览器跑完才发现。
+      # 故意不加 continue-on-error —— 契约挂了就该红，不该带着坏代码去烧验证码额度。
+      - name: 离线自测（契约校验）
+        run: |
+          if [ ! -f selftest.py ]; then
+            echo "[ERROR] 缺少 selftest.py —— 契约自测是硬门禁，不能静默跳过"
+            exit 1
+          fi
+          python selftest.py --strict
+
+      # 退出码语义（见 SPEC §4）：0 全部成功/跳过、1 部分失败、2 全部失败。
+      # 这里故意不写 continue-on-error —— 让 job 变红是给 owner 的信号，
+      # 后续步骤统一用 if: always() 兜住，保证状态一定会被提交。
       - name: 执行续订
         run: python main.py
         env:
           PYTHONUNBUFFERED: 1
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          # 开关不是密钥，用 Repository variable：Settings → Variables 加 DRY_RUN=1
+          # 就能空跑一次验证选择器是否还匹配站点，不动真格。
+          DRY_RUN: ${{ vars.DRY_RUN || '0' }}
 
       - name: 上传截图
         if: always()
@@ -102,20 +195,170 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-      - name: 更新时间文件
-        if: always()
-        run: echo "$(date +'%Y-%m-%d %H:%M:%S')" > time.txt
-
-      - name: Commit time.txt to repo
+      # ---------- 运行摘要 --------------------------------------------------------
+      # 失败时不用翻几百行日志：这里把 state.json 渲染成表格写进 Run 页面的 Summary。
+      - name: 生成运行摘要
         if: always()
         run: |
+          python - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+
+          SUMMARY = os.environ.get("GITHUB_STEP_SUMMARY")
+          if not SUMMARY:
+              print("[WARN] 没有 GITHUB_STEP_SUMMARY，跳过")
+              raise SystemExit(0)
+
+          def load_state():
+              """state.json 可能不存在 / JSON 损坏 / schema 不符 —— 一律当空 state。"""
+              try:
+                  with open("state.json", encoding="utf-8") as f:
+                      data = json.load(f)
+              except FileNotFoundError:
+                  print("[WARN] state.json 不存在（首次运行？）")
+                  return {}
+              except Exception as exc:
+                  print(f"[WARN] state.json 解析失败: {exc}")
+                  return {}
+              if not isinstance(data, dict):
+                  print("[WARN] state.json 顶层不是对象，忽略")
+                  return {}
+              return data
+
+          def human_time(value):
+              """ISO8601 -> 'YYYY-MM-DD HH:MM UTC'；解析不了就原样返回。"""
+              if not value or not isinstance(value, str):
+                  return "-"
+              try:
+                  dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+              except Exception:
+                  return value
+              if dt.tzinfo is None:
+                  dt = dt.replace(tzinfo=timezone.utc)
+              return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+          STATUS = {
+              "success": "✅ 成功",
+              "failed": "❌ 失败",
+              "failure": "❌ 失败",
+              "skipped": "⏭ 跳过",
+              "dry_run": "🧪 空跑",
+              "unknown": "❔ 未知",
+          }
+
+          def cell(text):
+              """表格里不能出现裸竖线和换行。"""
+              text = "" if text is None else str(text)
+              text = text.replace("|", "\\|").replace("\n", " ").strip()
+              return text or "-"
+
+          state = load_state()
+          servers = state.get("servers") if isinstance(state.get("servers"), dict) else {}
+          last_run = state.get("last_run") if isinstance(state.get("last_run"), dict) else {}
+
+          out = ["## Host2Play 续期结果", ""]
+
+          ok = last_run.get("ok", 0)
+          failed = last_run.get("failed", 0)
+          skipped = last_run.get("skipped", 0)
+          retryable = last_run.get("retryable", False)
+          retry_hint = last_run.get("retry_hint") or ""
+
+          out.append(f"**汇总**：成功 {ok} · 失败 {failed} · 跳过 {skipped}")
+          if last_run.get("started_at") or last_run.get("finished_at"):
+              out.append(
+                  f"**本次运行**：{human_time(last_run.get('started_at'))}"
+                  f" → {human_time(last_run.get('finished_at'))}"
+              )
+          out.append(
+              "**可重试**："
+              + ("是（会自动触发下一轮）" if retryable else "否（不再自动重跑）")
+          )
+          if retry_hint:
+              out.append(f"**重试提示**：{cell(retry_hint)}")
+          out.append("")
+
+          if not servers:
+              out.append("> 没有服务器记录：`state.json` 不存在、为空或解析失败。")
+          else:
+              out.append("| 服务器 | 状态 | 到期时间 | 原因 |")
+              out.append("| --- | --- | --- | --- |")
+              for key in sorted(servers, key=lambda k: str(servers[k].get("name") or k)):
+                  entry = servers[key] if isinstance(servers[key], dict) else {}
+                  name = entry.get("name") or key
+                  status = STATUS.get(entry.get("last_status"), entry.get("last_status") or "unknown")
+                  expiry = human_time(entry.get("expiry_iso")) if entry.get("expiry_iso") else (
+                      entry.get("expiry_raw") or "-"
+                  )
+                  reason = entry.get("last_reason") or ""
+                  fails = entry.get("consecutive_failures") or 0
+                  if fails:
+                      reason = f"{reason}（连续失败 {fails} 次）" if reason else f"连续失败 {fails} 次"
+                  out.append(
+                      f"| {cell(name)} | {cell(status)} | {cell(expiry)} | {cell(reason)} |"
+                  )
+
+          out.append("")
+          out.append(f"<sub>生成于 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}</sub>")
+
+          with open(SUMMARY, "a", encoding="utf-8") as f:
+              f.write("\n".join(out) + "\n")
+          print("[INFO] 运行摘要已写入 GITHUB_STEP_SUMMARY")
+          PY
+
+      - name: 更新时间文件
+        if: always()
+        run: echo "$(date -u +'%Y-%m-%d %H:%M:%S UTC')" > time.txt
+
+      # ---------- 状态回写 --------------------------------------------------------
+      # state.json 是跨 run 的唯一记忆（到期时间 / 上次成功时间 / 连续失败数）。
+      # 不提交它，rerun-workflow 就无从判断 retryable，冷却期也永远失效。
+      - name: 提交 state.json + time.txt
+        if: always()
+        run: |
+          set -uo pipefail
+
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add time.txt
-          if git diff --cached --quiet; then exit 0; fi
-          git commit -m "⏱️ 更新时间文件"
-          git pull --rebase origin main || true
-          git push origin HEAD:main
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          BRANCH="${GITHUB_REF_NAME}"
+          ADDED=0
+          for f in state.json time.txt; do
+            if [ -f "$f" ]; then
+              git add -- "$f"
+              ADDED=1
+            else
+              echo "[WARN] $f 不存在，跳过"
+            fi
+          done
+
+          if [ "$ADDED" -eq 0 ]; then
+            echo "[INFO] 没有可提交的文件"
+            exit 0
+          fi
+
+          if git diff --cached --quiet; then
+            echo "[INFO] 内容无变化，无需提交"
+            exit 0
+          fi
+
+          git commit -m "🤖 更新续期状态 $(date -u +'%Y-%m-%d %H:%M UTC')"
+
+          for i in 1 2 3; do
+            echo "[INFO] push 尝试 ${i}/3（目标分支 ${BRANCH}）"
+            git rebase --abort 2>/dev/null || true
+            if git pull --rebase --autostash origin "$BRANCH" \
+               && git push origin "HEAD:${BRANCH}"; then
+              echo "[INFO] push 成功"
+              exit 0
+            fi
+            echo "[WARN] 第 ${i} 次 push 失败，$((i * 5)) 秒后重试"
+            sleep $((i * 5))
+          done
+
+          echo "[ERROR] push 连续 3 次失败，状态未回写仓库"
+          exit 1
 
       - name: 清理历史运行记录
         if: always()
@@ -127,37 +370,99 @@ jobs:
           retain_days: 0
           keep_minimum_runs: 5
 
+  # ==============================================================================
+  # 分级重试：只有"确实值得再跑一轮"时才重新 dispatch。
+  #
+  # if 用 == 'failure' 而不是 != 'cancelled'：
+  #   全部成功 → exit 0 → job 绿 → 根本不起这个 job（省一个 runner）
+  #   部分失败 → exit 1 → job 红 → 起这个 job
+  #   全部失败 → exit 2 → job 红 → 起这个 job
+  # 起来之后再看 state.json 决定要不要真的 dispatch：
+  #   last_run.retryable === true  → 全部失败且原因可能是临时的（SPEC §4）
+  #   retry < 3                    → 总重试轮数上限
+  #
+  # 不用 needs.result 单独判重跑：部分成功（比如 2 个成功、1 个失败）也会让 job
+  # 变红，那时整轮重跑会白烧验证码额度，还可能把已经续好的服务器再续一遍。
+  # ==============================================================================
   rerun-workflow:
     name: 自动重启工作流
     needs: run-renew
     if: ${{ always() && needs.run-renew.result == 'failure' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
-      - name: 重新触发自己
-        uses: actions/github-script@v7
+      - name: 按 state.json 判断是否需要重跑
+        uses: actions/github-script@v9
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const retry = Number('${{ github.event.inputs.retry || 0 }}');
+            // 走 context.payload 取值，不做字符串插值 —— 避免 inputs 里的内容被当成代码执行
+            const retryRaw = (context.payload.inputs && context.payload.inputs.retry) || '0';
+            const retry = Number(retryRaw) || 0;
+            const maxRetry = 3;
 
-            console.log(`当前重试次数: ${retry}`);
+            const defaultBranch =
+              (context.payload.repository && context.payload.repository.default_branch) || 'main';
 
-            if (retry >= 5) {
-              console.log("达到最大重试次数");
+            console.log(`当前重试次数: ${retry} / 上限 ${maxRetry}`);
+            console.log(`run-renew 结果: ${process.env.RUN_RENEW_RESULT || 'unknown'}`);
+
+            let retryable = false;
+            let retryHint = '';
+
+            // state.json 可能不存在（首次运行）或 JSON 损坏 —— 一律按"不重跑"处理，
+            // 因为无法证明这轮失败值得再烧一次验证码额度。
+            try {
+              const res = await github.rest.repos.getContent({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                path: 'state.json',
+                ref: defaultBranch,
+              });
+
+              if (!res.data || !res.data.content) {
+                console.log('state.json 内容为空（可能超过 1MB），按不可重试处理');
+              } else {
+                const raw = Buffer.from(res.data.content, 'base64').toString('utf8');
+                const state = JSON.parse(raw);
+                const lastRun = (state && state.last_run) || {};
+                retryable = lastRun.retryable === true;
+                retryHint = lastRun.retry_hint || '';
+                console.log(
+                  `state.json: retryable=${retryable} ok=${lastRun.ok} failed=${lastRun.failed} skipped=${lastRun.skipped}`
+                );
+                if (retryHint) console.log(`retry_hint: ${retryHint}`);
+              }
+            } catch (err) {
+              console.log(`读取 state.json 失败，按不可重试处理: ${err.message}`);
+              retryable = false;
+            }
+
+            if (!retryable) {
+              console.log('⏭ 跳过重跑：last_run.retryable 不为 true（有成功/跳过项，或失败属于结构性原因）');
               return;
             }
-             
-            const workflowFile = "Host2Play_Renew.yml"; 
 
-            await github.rest.actions.createWorkflowDispatch({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              workflow_id: workflowFile,  // ✅ 更稳
-              ref: context.ref.replace('refs/heads/', ''),
-              inputs: {
-                retry: String(retry + 1)
-              }
-            });
+            if (retry >= maxRetry) {
+              console.log(`⏭ 跳过重跑：重试次数 ${retry} 已达上限 ${maxRetry}`);
+              return;
+            }
 
-            console.log(`已触发新的 Workflow，重试次数 ${retry + 1}`);
+            const workflowFile = 'Host2Play_Renew.yml';
+
+            try {
+              await github.rest.actions.createWorkflowDispatch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: workflowFile,
+                ref: defaultBranch,
+                inputs: { retry: String(retry + 1) },
+              });
+              console.log(`✅ 已触发新的 Workflow，重试次数 ${retry + 1}`);
+            } catch (err) {
+              console.log(`❌ 触发 Workflow 失败: ${err.message}`);
+              core.setFailed(`触发 Workflow 失败: ${err.message}`);
+            }
+        env:
+          RUN_RENEW_RESULT: ${{ needs.run-renew.result }}
