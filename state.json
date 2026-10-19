@@ -4,11 +4,11 @@
       "expiry_iso": "2026-10-20T00:18:56+00:00",
       "expiry_raw": "2026-10-20 00:18:56 UTC",
       "host": "host2play.gratis",
-      "last_reason": "DRY_RUN 预检: 剩余 7.3h 已超过阈值 2h",
-      "last_status": "dry_run",
+      "last_reason": "剩余 7.1h 已超过阈值 2h",
+      "last_status": "skipped",
       "name": "fvf8042"
     }
   },
-  "updated_at": "2026-10-19T17:01:57+00:00",
+  "updated_at": "2026-10-19T17:12:07+00:00",
   "version": 1
 }
