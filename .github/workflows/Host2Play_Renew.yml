@@ -180,6 +180,11 @@ jobs:
         run: python main.py
         env:
           PYTHONUNBUFFERED: 1
+          # 续期链接必须走 Secret，不要写进代码或 workflow 明文。
+          # 链接里的 i=<uuid> 是免鉴权的续期凭据：拿到它的人无需登录就能给你的
+          # 服务器续期。仓库是 public 时，明文等于公开凭据。
+          # 配置位置：Settings → Secrets and variables → Actions → New repository secret
+          RENEW_URLS: ${{ secrets.RENEW_URLS }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           # 开关不是密钥，用 Repository variable：Settings → Variables 加 DRY_RUN=1

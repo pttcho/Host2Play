@@ -304,9 +304,17 @@ RENEW_JS = r"""
 })()
 """
 
-DEFAULT_RENEW_URLS = [
-    "https://host2play.gratis/server/renew?i=1b8280df-1118-4601-9e5f-41e6c7ae6855",
-]
+# 续期链接从这里读，但**默认留空**。
+#
+# 为什么留空：续期链接里的 i=<uuid> 是免鉴权的续期凭据 —— 任何拿到它的人都能
+# 调 /publicapis/renewServer 给你的服务器续期（不需要登录、不需要密码）。
+# 把它写死在源码里再推到 public 仓库，等于把凭据公开。
+#
+# 正确用法：在仓库 Settings → Secrets and variables → Actions 里加一条
+#   RENEW_URLS = https://host2play.gratis/server/renew?i=xxx,https://...?i=yyy
+# workflow 会通过环境变量注入（见 .github/workflows/Host2Play_Renew.yml）。
+# 本地调试则用同名环境变量，或临时改这里但**不要提交**。
+DEFAULT_RENEW_URLS = []
 
 STATE_VERSION = 1
 DEFAULT_STATE_FILE = "state.json"
@@ -535,12 +543,20 @@ def extract_server_id(url):
 
 
 def server_key(url):
-    """从续期链接提取稳定 key：有 ?i=<id> 时返回 id，否则返回 url 的 sha1 前 12 位。"""
+    """从续期链接算一个稳定、**不可逆**的 key，用作 state.json 的键。
+
+    为什么不能直接用 ?i=<id>：那个 id 就是续期凭据本身。state.json 要提交回
+    仓库（跨运行记忆），仓库又是 public，等于把凭据二次泄露一遍 —— 而且是以
+    "看起来像内部状态"的形式躺在版本历史里，比写在源码里更难被发现。
+
+    这里统一走 sha1 前 12 位：同一个链接永远得到同一个 key（冷却/历史记录才能
+    对上），但无法从 key 反推出原始 id。12 位十六进制 = 48 bit，单仓库量级下
+    碰撞概率可忽略。
+    """
     try:
-        identifier = extract_server_id(url)
-        if identifier:
-            return identifier
         raw = url.strip() if isinstance(url, str) else str(url or "").strip()
+        if not raw:
+            return "000000000000"
         return hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:12]
     except Exception:
         return "000000000000"
@@ -767,12 +783,40 @@ def _plain(text) -> str:
     )
 
 
+def _mask_url(url: str) -> str:
+    """把续期链接里的 i=<uuid> 打码，只留主机名和 id 的前后各 4 位。
+
+    Telegram 消息、截图、Actions 日志都可能被截图转发或长期留存，完整链接等于
+    把免鉴权凭据散播出去。这里保留可辨认性（同一个服务器前后一致）但不可用。
+    """
+    try:
+        raw = str(url or "").strip()
+        if not raw:
+            return "未知"
+        parsed = urlparse(raw)
+        host = parsed.netloc or ""
+        identifier = ""
+        try:
+            identifier = (parse_qs(parsed.query).get("i") or [""])[0]
+        except Exception:
+            identifier = ""
+        if not identifier:
+            return host or "未知"
+        if len(identifier) > 10:
+            shown = f"{identifier[:4]}…{identifier[-4:]}"
+        else:
+            shown = identifier[:2] + "…"
+        return f"{host}/…?i={shown}"
+    except Exception:
+        return "未知"
+
+
 def build_caption(ok, server_name, url, old_expiry, new_expiry, reason="", skipped=False):
     """生成 Telegram 文案。纯文本，不带任何 HTML 标签，避免 parse_mode 转义问题。"""
     name = _plain((server_name or "").strip() or "未知")
     old = _plain((old_expiry or "").strip() or "未知")
     new = _plain((new_expiry or "").strip() or "未知")
-    link = _plain((url or "").strip() or "未知")
+    link = _plain(_mask_url(url))
     why = _plain((reason or "").strip())
 
     lines = []
@@ -2698,7 +2742,13 @@ def _apply_result(state: dict, lock, result: UrlResult, cfg: Config) -> None:
         if not isinstance(entry, dict):
             entry = {}
 
-        entry["url"] = result.url
+        # 不存完整 URL：它含 i=<uuid> 这个免鉴权凭据，而 state.json 会提交回
+        # public 仓库。只保留脱敏后的主机名，够人工辨认，不足以被拿去续期。
+        try:
+            parsed = urlparse(result.url or "")
+            entry["host"] = parsed.netloc or ""
+        except Exception:
+            pass
         if result.name:
             entry["name"] = result.name
         if result.new_raw:
@@ -3049,7 +3099,11 @@ def write_step_summary(results, ok: int, failed: int, skipped: int) -> None:
 # ===========================================================================
 def run_renew(cfg: Config) -> int:
     if not cfg.urls:
-        log("未配置任何续期链接（RENEW_URLS 为空）", "ERROR")
+        log(
+            "未配置任何续期链接。请到仓库 Settings → Secrets and variables → Actions "
+            "添加名为 RENEW_URLS 的 Secret，值为续期链接（多个用英文逗号分隔）。",
+            "ERROR",
+        )
         return 1
     if requests is None:
         log("缺少 requests 库，无法继续。请执行: pip install requests", "ERROR")

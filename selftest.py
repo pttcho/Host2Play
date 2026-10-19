@@ -378,11 +378,18 @@ class ParseExpiryInvalidTests(unittest.TestCase):
 # server_key
 # ==============================================================================
 class ServerKeyTests(unittest.TestCase):
-    """测 server_key：?i= 提取、sha1 前缀兜底、稳定性、非法输入不抛异常。"""
+    """测 server_key：一律 sha1 前缀、稳定性、不含明文凭据、非法输入不抛异常。
 
+    关键约束：server_key 的返回值会作为 state.json 的 dict key，而 state.json 要
+    提交回 public 仓库。所以它**绝不能**原样返回 ?i=<uuid> —— 那是免鉴权的续期
+    凭据。这里专门断言返回值里不含原始 id。
+    """
+
+    # 测试用的假 UUID，不要替换成真实服务器 ID —— 真实续期链接是免鉴权凭据，
+    # 出现在 public 仓库里等于公开。这里只用固定假值验证提取逻辑。
     RENEW_URL = (
         "https://host2play.gratis/server/renew"
-        "?i=1b8280df-1118-4601-9e5f-41e6c7ae6855"
+        "?i=00000000-1111-2222-3333-444444444444"
     )
     PLAIN_A = "https://host2play.gratis/server/renew/abc123"
     PLAIN_B = "https://host2play.gratis/server/renew/def456"
@@ -390,28 +397,51 @@ class ServerKeyTests(unittest.TestCase):
     def setUp(self):
         self.server_key = require_function(self, "server_key")
 
-    def test_extracts_i_parameter(self):
-        """有 ?i=<uuid> 时返回该 uuid。"""
-        expected = "1b8280df-1118-4601-9e5f-41e6c7ae6855"
+    def test_key_never_contains_raw_id(self):
+        """返回值不得包含 ?i= 的原始值（凭据不能进 state.json）。"""
         got = self.server_key(self.RENEW_URL)
-        self.assertEqual(
-            got, expected,
-            "server_key(%r) = %r，期望 %r" % (self.RENEW_URL, got, expected),
+        raw_id = i_param(self.RENEW_URL)
+        self.assertNotIn(
+            raw_id, str(got),
+            "server_key 返回值 %r 含有明文凭据 %r；state.json 会被提交回 public 仓库，"
+            "绝不能存原始 id" % (got, raw_id),
         )
-        # 用 urllib.parse 独立复核：返回值应等于 ?i= 的值
-        self.assertEqual(
-            got, i_param(self.RENEW_URL),
-            "server_key 返回值 %r 与 urllib.parse 解析出的 i=%r 不一致"
-            % (got, i_param(self.RENEW_URL)),
+
+    def test_key_is_12_hex_chars(self):
+        """无论有没有 ?i=，都返回 12 位小写十六进制。"""
+        for url in (self.RENEW_URL, self.PLAIN_A, self.PLAIN_B):
+            got = str(self.server_key(url))
+            self.assertRegex(
+                got, r"^[0-9a-f]{12}$",
+                "server_key(%r) = %r，期望 12 位小写十六进制" % (url, got),
+            )
+
+    def test_different_ids_give_different_keys(self):
+        """不同服务器必须得到不同 key，否则 state 会互相覆盖。"""
+        a = self.server_key(
+            "https://host2play.gratis/server/renew?i=00000000-1111-2222-3333-444444444444"
+        )
+        b = self.server_key(
+            "https://host2play.gratis/server/renew?i=99999999-8888-7777-6666-555555555555"
+        )
+        self.assertNotEqual(
+            a, b, "两个不同 id 得到相同 key %r，state 会互相覆盖" % (a,),
         )
 
     def test_extracts_i_parameter_with_extra_query(self):
-        """?i= 后面还有别的查询参数时，仍能正确提取 i。"""
+        """?i= 后面还有别的查询参数时，仍稳定算出同一个 key。"""
         url = self.RENEW_URL + "&utm_source=x&x=1"
-        expected = "1b8280df-1118-4601-9e5f-41e6c7ae6855"
+        base = self.server_key(self.RENEW_URL)
         got = self.server_key(url)
-        self.assertEqual(
-            got, expected, "server_key(%r) = %r，期望 %r" % (url, got, expected)
+        # 多出查询参数会改变 sha1，这里只要求形状正确、不含明文
+        self.assertRegex(
+            str(got), r"^[0-9a-f]{12}$",
+            "server_key(%r) = %r，期望 12 位十六进制" % (url, got),
+        )
+        self.assertNotIn(i_param(self.RENEW_URL), str(got))
+        self.assertNotEqual(
+            base, got,
+            "带额外查询参数时 key 应与原 URL 不同（sha1 覆盖完整 URL）",
         )
 
     def test_stable_across_two_calls(self):
@@ -649,7 +679,11 @@ class BuildCaptionTests(unittest.TestCase):
         )
 
     def test_success_contains_server_old_new_and_url(self):
-        """成功文案必须含：服务器名、旧到期、新到期、URL。"""
+        """成功文案必须含：服务器名、旧到期、新到期，以及脱敏后的主机名。
+
+        URL 不要求完整出现 —— 完整链接里的 i=<uuid> 是免鉴权凭据，文案必须脱敏。
+        这里断言"主机名在、原始 id 不在"。
+        """
         caption = self._caption(True)
         self.assertIsInstance(
             caption, str, "成功文案返回 %r，期望 str" % type(caption)
@@ -658,12 +692,25 @@ class BuildCaptionTests(unittest.TestCase):
             ("服务器名", self.SERVER),
             ("旧到期", self.OLD),
             ("新到期", self.NEW),
-            ("URL", self.URL),
+            ("主机名", "host2play.gratis"),
         ):
             self.assertIn(
                 needle, caption,
                 "成功文案缺少%s %r；实际文案：\n%s" % (label, needle, caption),
             )
+
+    def test_success_caption_masks_credential(self):
+        """文案里不得出现完整续期链接或原始 i=<uuid>（Telegram 会长期留存）。"""
+        caption = self._caption(True)
+        raw_id = i_param(self.URL)
+        self.assertNotIn(
+            raw_id, caption,
+            "成功文案泄露了原始凭据 %r；实际文案：\n%s" % (raw_id, caption),
+        )
+        self.assertNotIn(
+            "?i=" + raw_id, caption,
+            "成功文案含完整续期链接；实际文案：\n%s" % caption,
+        )
 
     def test_failure_contains_reason(self):
         """失败文案必须含失败原因原文。"""

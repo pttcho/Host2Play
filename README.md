@@ -19,27 +19,37 @@
 
 ## 📋 前置要求
 
-### 1. 配置续期链接（必须）
+### 1. 配置续期链接（必须，走 Secret）
 
-编辑仓库根目录下的 [main.py](./main.py)，找到 `DEFAULT_RENEW_URLS` 列表，填入你的 Host2Play 服务器续期链接。
+**不要把续期链接写进代码。** 链接里的 `i=<uuid>` 是**免鉴权的续期凭据** —— 任何拿到它的人都能调 `/publicapis/renewServer` 给你的服务器续期，不需要登录、不需要密码。仓库是 public 时，写进代码等于公开凭据。
+
+正确做法：进入仓库 `Settings` → `Secrets and variables` → `Actions` → **New repository secret**
+
+| Secret 名称 | 值 |
+|---|---|
+| `RENEW_URLS` | `https://host2play.gratis/server/renew?i=你的服务器ID` |
+
+多个服务器用**英文逗号**分隔：
+
+```
+https://host2play.gratis/server/renew?i=aaaa,https://host2play.gratis/server/renew?i=bbbb
+```
+
+**如何获取链接：**
+打开 [Host2Play Minecraft 面板](https://host2play.gratis/panel/minecraft)，找到你的服务器，点击 **Copy public renew link** 即可复制。
 
 **链接格式：**
 ```
 https://host2play.gratis/server/renew?i=你的服务器ID
 ```
 
-**如何获取链接：**
-打开 [Host2Play Minecraft 面板](https://host2play.gratis/panel/minecraft)，找到你的服务器，点击 **Copy public renew link** 即可复制续期链接，然后填入 `main.py` 的 `DEFAULT_RENEW_URLS` 列表中。
+> 代码里的 `DEFAULT_RENEW_URLS` 默认为空列表。本地调试时可以用同名环境变量：
+> ```bash
+> RENEW_URLS="https://host2play.gratis/server/renew?i=xxx" python main.py --check
+> ```
+> 或临时改 `DEFAULT_RENEW_URLS`，但**提交前务必改回空**。
 
-示例：
-```python
-DEFAULT_RENEW_URLS = [
-    "https://host2play.gratis/server/renew?i=6666666-6666-6666-6666-66666666666",
-    "https://host2play.gratis/server/renew?i=另一个服务器ID",
-]
-```
-
-> 不想改代码？也可以在仓库 `Settings` → `Secrets and variables` → `Actions` → `Variables` 里加一个 `RENEW_URLS`，值用英文逗号分隔多个链接。环境变量优先级高于代码里的列表。
+> ⚠️ 如果你的链接曾经明文提交过（写进过 main.py 并 push），它已经留在 git 历史里，删文件没用。建议去面板重新生成续期链接（或重建服务器拿新 ID），旧链接作废即可 —— 不必为此 force push 重写历史。
 
 ### 2. 配置 Telegram 通知（可选）
 
@@ -189,7 +199,7 @@ curl -X POST \
 | `RENEW_COOLDOWN_HOURS` | `6` | **成功后多久内不重复续期**。防止同一窗口内反复重试。注意：进入续期窗口（剩余 ≤ 阈值）后冷却不再阻拦，只在剩余时间还充裕时生效 |
 | `STALE_AFTER_HOURS` | `30` | **兜底强制续期**。超过这么久没成功续期，无视上面两个阈值强制续一次。用于 GitHub 调度连续被丢弃的极端情况。设 `0` = 关闭兜底 |
 | `JOB_BUDGET_MINUTES` | `20` | **整体时间预算**。超预算后不再开新 URL。每小时运行一次，单次必须快；多服务器（5 个以上）建议调到 30–40 |
-| `RENEW_URLS` | 空 | 逗号分隔的续期链接，**覆盖** `main.py` 里的 `DEFAULT_RENEW_URLS`。适合不想改代码的场景 |
+| `RENEW_URLS` | 空 | **续期链接，必须配成 Secret**。逗号分隔多个链接。链接里的 `i=<uuid>` 是免鉴权凭据，写进代码等于公开 |
 | `DRY_RUN` | `0` | 设 `1` = 只调 API 读状态，不启动浏览器、不点续期、不碰验证码。**调试时必用**，详见[故障排查](#-故障排查) |
 | `PARALLEL_URLS` | `1` | 并发处理的 URL 数。WARP 轮换有全局锁，调到 2–3 可以，再高收益递减且更容易触发风控 |
 | `CAPTCHA_MAX_PER_PAGE` | `8` | 单页面验证码尝试上限。识别率低时可提到 10–12；额度紧张时降到 5 |
@@ -254,7 +264,7 @@ git push
 ## ❓ 常见问题
 
 ### 1. 如何获取续期链接？
-打开 [Host2Play Minecraft 面板](https://host2play.gratis/panel/minecraft)，找到你的服务器，点击 **Copy public renew link** 即可获得续期链接。将其复制到 `main.py` 的 `DEFAULT_RENEW_URLS` 列表中，或者用 `RENEW_URLS` 环境变量覆盖。
+打开 [Host2Play Minecraft 面板](https://host2play.gratis/panel/minecraft)，找到你的服务器，点击 **Copy public renew link** 即可获得续期链接。然后到仓库 `Settings` → `Secrets and variables` → `Actions` 添加名为 `RENEW_URLS` 的 Secret。**不要写进代码**（见[前置要求](#1-配置续期链接必须走-secret)）。
 
 ### 2. 验证码识别失败怎么办？
 脚本内置了音频识别流程，但如果识别率较低，可能是以下原因：
@@ -284,7 +294,7 @@ Host2Play 的续期页面嵌入了 Google reCAPTCHA。当短时间内多次尝�
 每次运行的详情页顶部有 **Summary** 区域，里面有服务器 / 状态 / 到期时间 / 原因的四列表格，以及成功、失败、跳过数量和"是否可重试"的结论。失败时先看这里，通常不用翻日志。
 
 ### 8. 能否同时续期多个服务器？
-可以。在 `DEFAULT_RENEW_URLS` 列表（或 `RENEW_URLS` 环境变量）中填入多个链接即可。每个链接独立尝试，互不影响，最终 Telegram 通知也会分别推送。想并行处理可以调 `PARALLEL_URLS`，但注意 WARP 轮换有全局锁。
+可以。在 `RENEW_URLS` Secret 里用英文逗号分隔多个链接即可。每个链接独立尝试，互不影响，最终 Telegram 通知也会分别推送。想并行处理可以调 `PARALLEL_URLS`，但注意 WARP 轮换有全局锁。
 
 ### 9. 运行时间很长是否正常？
 正常。每次续期需要启动 Chrome、加载页面、处理验证码、可能还需要切换 IP 并重试，单个链接通常需要 2～5 分钟，遇到多次 IP 封锁会更久。但如果**每次都在冷却期内秒退**，那是设计如此 —— 说明服务器剩余时间还够，没必要打扰它。
@@ -297,8 +307,32 @@ Host2Play 的续期页面嵌入了 Google reCAPTCHA。当短时间内多次尝�
 
 ## 🔒 安全建议
 
-- ✅ **敏感信息存放**：Telegram Token 等信息请严格存储在 GitHub Secrets 中，不要直接写在代码里。
-- ✅ **定期维护**：如果 Host2Play 网站更新了页面结构，可能需要更新元素定位逻辑。用 `python main.py --check` 一屏定位，改 `main.py` 顶部的 `SELECTORS` 字典即可。
+### 续期链接是凭据，不是配置
+
+链接里的 `i=<uuid>` **没有鉴权**：任何拿到它的人都能调 `/publicapis/renewServer` 给你的服务器续期，不需要登录、不需要密码。所以它出现在任何会被提交或转发的地方都是泄露：
+
+| 位置 | 处理方式 |
+|---|---|
+| `main.py` 源码 | `DEFAULT_RENEW_URLS` 默认为空，改用 `RENEW_URLS` Secret |
+| `state.json` | key 用 sha1 哈希（`082dfb9b6753`），只存主机名，不存完整 URL |
+| Actions 日志 | 只打印哈希 key，不打印链接 |
+| Telegram 文案 | 脱敏为 `host2play.gratis/…?i=1b82…6855` |
+| 截图文件名 | 用哈希 key，不含链接 |
+
+> 注意：**完整链接仍然会出现在浏览器地址栏和页面请求里**，所以 Actions 的 artifact（截图）不包含链接文本，但如果站点把 URL 渲染在页面上，截图里可能有。公开仓库建议把 artifact 保留期设短一些。
+
+### 如果链接曾经明文提交过
+
+`git rm` 删文件没用 —— 它还在历史里。三个选项：
+
+1. **换 ID（推荐）**：去面板重新生成续期链接，或重建服务器拿新 ID。旧链接立即失效，成本最低，不用动 git 历史。
+2. **清历史**：`git filter-repo --replace-text` 或 BFG，会重写所有 commit hash，需要 force push，协作者要重新 clone。
+3. **转 private**：仓库设为私有，但历史里的凭据对协作者仍然可见。
+
+### 其他
+
+- ✅ **敏感信息存放**：`RENEW_URLS`、Telegram Token 请严格存储在 GitHub Secrets 中。
+- ✅ **定期维护**：如果 Host2Play 网站更新了页面结构，用 `python main.py --check` 一屏定位，改 `main.py` 顶部的 `SELECTORS` 字典即可。
 - ✅ **Actions 权限**：默认的 `GITHUB_TOKEN` 权限已满足需要，无需额外设置。
 - ✅ **Fork 安全**：建议保持 Fork 仓库同步，以便获取最新的脚本修复。
 
