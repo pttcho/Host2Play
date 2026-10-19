@@ -3,6 +3,10 @@ output/
 __pycache__/
 *.pyc
 
+# 本次运行的统计（retryable / ok / failed / skipped）。每次运行必变，
+# 只用于 workflow 内部判断，不进仓库 —— 否则每小时一条提交。
+state.last_run.json
+
 # 注意：state.json 必须提交回仓库，不要加进这里。
 # 它是跨运行的唯一记忆（到期时间 / 上次成功时间 / 连续失败次数），
 # 不提交的话每次运行都会被当作"首次运行"，冷却与剩余时间判断全部失效。

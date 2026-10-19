@@ -1,23 +1,14 @@
 {
-  "last_run": {
-    "failed": 0,
-    "finished_at": "2026-10-19T16:53:50+00:00",
-    "ok": 0,
-    "retry_hint": "",
-    "retryable": false,
-    "skipped": 1,
-    "started_at": "2026-10-19T16:53:48+00:00"
-  },
   "servers": {
     "082dfb9b6753": {
       "expiry_iso": "2026-10-20T00:18:56+00:00",
       "expiry_raw": "2026-10-20 00:18:56 UTC",
       "host": "host2play.gratis",
-      "last_reason": "剩余 7.4h 已超过阈值 2h",
-      "last_status": "skipped",
+      "last_reason": "DRY_RUN 预检: 剩余 7.3h 已超过阈值 2h",
+      "last_status": "dry_run",
       "name": "fvf8042"
     }
   },
-  "updated_at": "2026-10-19T16:53:50+00:00",
+  "updated_at": "2026-10-19T17:01:57+00:00",
   "version": 1
 }

@@ -1167,50 +1167,84 @@ def load_state(path: str = DEFAULT_STATE_FILE) -> dict:
 def save_state(state: dict, path: str = DEFAULT_STATE_FILE) -> bool:
     """原子写：同目录 tmp 文件 + fsync + os.replace，避免半截 JSON 被提交回仓库。
 
-    `updated_at` 只在内容真的变了才刷新：调度改成每小时一次后，如果每次运行都
-    无条件更新时间戳，仓库就会每小时多一条只有时间戳变化的提交。这里先把
-    updated_at 摘掉再比较，内容一致就整份不写，让 workflow 的
-    `git diff --cached --quiet` 能正确判定"无需提交"。
+    关键设计：**`last_run` 不写进仓库文件**。
+    调度是每小时一次，而 `last_run` 里全是每次必变的字段（started_at /
+    finished_at / ok / skipped）。如果照写，就会变成每小时一条"只有时间戳变化"
+    的提交，一天 24 条、一个月 720 条，把仓库历史彻底淹没。
+
+    `last_run` 的唯一用途是给 workflow 的 rerun-gate 判断 retryable，那是**本次
+    运行内**的事，写进同目录的旁路文件（默认 `state.last_run.json`，已在
+    .gitignore 里）就够，不需要跨运行持久化。
+
+    真正需要跨运行记忆的是 `servers`（到期时间、上次成功时间、连续失败数），
+    它只在续期成功/失败/状态变化时才变，所以提交频率会降到"只在真有事时"。
     """
     try:
         state["version"] = STATE_VERSION
         state["updated_at"] = _now_iso()
 
-        payload = json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True)
+        # 拆成两份：仓库里只放 servers（稳定），last_run 走旁路文件
+        persisted = {k: v for k, v in state.items() if k != "last_run"}
+        last_run = state.get("last_run")
+
+        payload = json.dumps(persisted, ensure_ascii=False, indent=2, sort_keys=True)
+
+        # 内容没变就整份不写，让 workflow 的 `git diff --cached --quiet` 能判定跳过
+        unchanged = False
         if os.path.exists(path):
             try:
                 with open(path, "r", encoding="utf-8") as handle:
                     existing = json.load(handle)
                 if isinstance(existing, dict):
                     existing.pop("updated_at", None)
-                    compare = dict(state)
+                    compare = dict(persisted)
                     compare.pop("updated_at", None)
-                    if existing == compare:
-                        # 内容没变，连时间戳都不动，避免制造无意义提交
-                        return True
+                    unchanged = existing == compare
             except Exception:
-                pass
+                unchanged = False
 
-        directory = os.path.dirname(os.path.abspath(path)) or "."
-        os.makedirs(directory, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(prefix=".state-", suffix=".json", dir=directory)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(payload)
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(tmp_path, path)
-        except Exception:
+        if not unchanged:
+            directory = os.path.dirname(os.path.abspath(path)) or "."
+            os.makedirs(directory, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=".state-", suffix=".json", dir=directory
+            )
             try:
-                os.unlink(tmp_path)
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(payload)
+                    handle.write("\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(tmp_path, path)
             except Exception:
-                pass
-            raise
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+                raise
+
+        # 旁路文件每次覆盖写（不进仓库，所以随便变）
+        if isinstance(last_run, dict) and last_run:
+            try:
+                side_path = _last_run_path(path)
+                side_dir = os.path.dirname(os.path.abspath(side_path)) or "."
+                os.makedirs(side_dir, exist_ok=True)
+                with open(side_path, "w", encoding="utf-8") as handle:
+                    json.dump(last_run, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                    handle.write("\n")
+            except Exception as exc:
+                log(f"last_run 旁路文件写入失败（不影响主流程）: {exc}", "WARN")
+
         return True
     except Exception as exc:
         log(f"state.json 写入失败: {exc}", "ERROR")
         return False
+
+
+def _last_run_path(state_path: str) -> str:
+    """旁路文件路径：与 state.json 同目录，加 .last_run 后缀，不进仓库。"""
+    directory = os.path.dirname(os.path.abspath(state_path)) or "."
+    return os.path.join(directory, "state.last_run.json")
 
 
 # ===========================================================================

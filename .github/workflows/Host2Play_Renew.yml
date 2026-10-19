@@ -73,6 +73,13 @@ jobs:
     # 真正需要续期时（剩 1~2 小时）单条 URL 约 1-3 分钟，20 分钟预算绰绰有余。
     timeout-minutes: 40
 
+    # 把本次运行的 retryable 传给 rerun-workflow。
+    # 为什么走 outputs 而不是让它去读仓库：last_run 已经不写进 state.json 了
+    # （那样会每小时产生一条只有时间戳变化的提交），仓库里查不到这个信息。
+    outputs:
+      retryable: ${{ steps.verdict.outputs.retryable }}
+      retry_hint: ${{ steps.verdict.outputs.retry_hint }}
+
     steps:
       - name: 拉取仓库
         uses: actions/checkout@v6
@@ -231,6 +238,19 @@ jobs:
                   return {}
               return data
 
+          def load_last_run():
+              """last_run 不进仓库（否则每小时一条提交），改读同目录旁路文件。"""
+              try:
+                  with open("state.last_run.json", encoding="utf-8") as f:
+                      data = json.load(f)
+              except FileNotFoundError:
+                  print("[WARN] state.last_run.json 不存在（首次运行或已清理）")
+                  return {}
+              except Exception as exc:
+                  print(f"[WARN] state.last_run.json 解析失败: {exc}")
+                  return {}
+              return data if isinstance(data, dict) else {}
+
           def human_time(value):
               """ISO8601 -> 'YYYY-MM-DD HH:MM UTC'；解析不了就原样返回。"""
               if not value or not isinstance(value, str):
@@ -260,7 +280,12 @@ jobs:
 
           state = load_state()
           servers = state.get("servers") if isinstance(state.get("servers"), dict) else {}
-          last_run = state.get("last_run") if isinstance(state.get("last_run"), dict) else {}
+          # last_run 优先读旁路文件；兼容老格式（还在 state.json 里）的仓库
+          last_run = load_last_run()
+          if not last_run:
+              last_run = (
+                  state.get("last_run") if isinstance(state.get("last_run"), dict) else {}
+              )
 
           out = ["## Host2Play 续期结果", ""]
 
@@ -312,13 +337,50 @@ jobs:
           print("[INFO] 运行摘要已写入 GITHUB_STEP_SUMMARY")
           PY
 
+      # 把 last_run 里的 retryable 提炼成 job output，供 rerun-workflow 判断。
+      # 单独一步是因为 job outputs 只能从 step outputs 取值。
+      - name: 提炼重试判据
+        id: verdict
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          import os
+
+          out = os.environ.get("GITHUB_OUTPUT")
+          retryable = "false"
+          hint = ""
+          try:
+              with open("state.last_run.json", encoding="utf-8") as f:
+                  last_run = json.load(f)
+              if isinstance(last_run, dict):
+                  retryable = "true" if last_run.get("retryable") is True else "false"
+                  hint = str(last_run.get("retry_hint") or "")
+          except FileNotFoundError:
+              print("[WARN] 没有 state.last_run.json，按不可重试处理")
+          except Exception as exc:
+              print(f"[WARN] 读取 state.last_run.json 失败: {exc}")
+
+          print(f"[INFO] retryable={retryable} retry_hint={hint or '-'}")
+          if out:
+              with open(out, "a", encoding="utf-8") as f:
+                  f.write(f"retryable={retryable}\n")
+                  # 多行值需要 heredoc 语法，这里压成单行避免注入
+                  f.write("retry_hint=" + hint.replace("\n", " ")[:200] + "\n")
+          PY
+
+      # time.txt 是"仓库保活"用的：GitHub 会在仓库连续 60 天无提交时自动停用
+      # schedule 触发器。所以它必须周期性变化，否则定时器会悄悄失效。
+      # 现在每小时跑一次，如果它每次都变，就会每小时一条提交 —— 所以下面在
+      # 提交步骤里做了判断：state.json 没变化时不单独为 time.txt 造提交，
+      # 只在"距上次提交超过 3 天"时才刷一次保活提交。
       - name: 更新时间文件
         if: always()
         run: echo "$(date -u +'%Y-%m-%d %H:%M:%S UTC')" > time.txt
 
       # ---------- 状态回写 --------------------------------------------------------
       # state.json 是跨 run 的唯一记忆（到期时间 / 上次成功时间 / 连续失败数）。
-      # 不提交它，rerun-workflow 就无从判断 retryable，冷却期也永远失效。
+      # last_run 不在里面 —— 它每次必变，写进去会变成每小时一条提交。
       - name: 提交 state.json + time.txt
         if: always()
         run: |
@@ -328,19 +390,35 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           BRANCH="${GITHUB_REF_NAME}"
-          ADDED=0
-          for f in state.json time.txt; do
-            if [ -f "$f" ]; then
-              git add -- "$f"
-              ADDED=1
-            else
-              echo "[WARN] $f 不存在，跳过"
-            fi
-          done
 
-          if [ "$ADDED" -eq 0 ]; then
-            echo "[INFO] 没有可提交的文件"
-            exit 0
+          # 先看 state.json 有没有真变化（到期时间 / 成功记录 / 失败计数）。
+          # 有 -> 连 time.txt 一起提交，这是"有事发生"的正常提交。
+          STATE_CHANGED=0
+          if [ -f state.json ]; then
+            git add -- state.json
+            if ! git diff --cached --quiet; then
+              STATE_CHANGED=1
+            fi
+          else
+            echo "[WARN] state.json 不存在"
+          fi
+
+          if [ "$STATE_CHANGED" -eq 1 ]; then
+            git add -- time.txt 2>/dev/null || true
+            echo "[INFO] state.json 有变化，提交状态"
+          else
+            # state.json 没变 = 这一小时什么都没发生。此时不该为时间戳造提交。
+            # 但仓库连续 60 天无提交会让 GitHub 停用 schedule，所以只在距上次
+            # 提交超过 3 天时才刷一次 time.txt 做保活。
+            LAST_COMMIT_EPOCH=$(git log -1 --format=%ct 2>/dev/null || echo 0)
+            NOW_EPOCH=$(date -u +%s)
+            AGE_DAYS=$(( (NOW_EPOCH - LAST_COMMIT_EPOCH) / 86400 ))
+            if [ "$AGE_DAYS" -lt 3 ]; then
+              echo "[INFO] state.json 无变化，且距上次提交 ${AGE_DAYS} 天（<3），跳过提交"
+              exit 0
+            fi
+            echo "[INFO] state.json 无变化，但已 ${AGE_DAYS} 天无提交，刷新 time.txt 保活"
+            git add -- time.txt 2>/dev/null || true
           fi
 
           if git diff --cached --quiet; then
@@ -416,33 +494,14 @@ jobs:
             let retryable = false;
             let retryHint = '';
 
-            // state.json 可能不存在（首次运行）或 JSON 损坏 —— 一律按"不重跑"处理，
-            // 因为无法证明这轮失败值得再烧一次验证码额度。
-            try {
-              const res = await github.rest.repos.getContent({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                path: 'state.json',
-                ref: defaultBranch,
-              });
-
-              if (!res.data || !res.data.content) {
-                console.log('state.json 内容为空（可能超过 1MB），按不可重试处理');
-              } else {
-                const raw = Buffer.from(res.data.content, 'base64').toString('utf8');
-                const state = JSON.parse(raw);
-                const lastRun = (state && state.last_run) || {};
-                retryable = lastRun.retryable === true;
-                retryHint = lastRun.retry_hint || '';
-                console.log(
-                  `state.json: retryable=${retryable} ok=${lastRun.ok} failed=${lastRun.failed} skipped=${lastRun.skipped}`
-                );
-                if (retryHint) console.log(`retry_hint: ${retryHint}`);
-              }
-            } catch (err) {
-              console.log(`读取 state.json 失败，按不可重试处理: ${err.message}`);
-              retryable = false;
-            }
+            // last_run 不再写进仓库（否则每小时一条提交），由 run-renew 通过
+            // job outputs 传过来。读不到就按"不重跑"处理 —— 无法证明这轮失败值得
+            // 再烧一次验证码额度。
+            const passed = String(process.env.RETRYABLE || '').toLowerCase();
+            retryable = passed === 'true';
+            retryHint = process.env.RETRY_HINT || '';
+            console.log(`retryable(来自上一 job): ${passed || '空'} -> ${retryable}`);
+            if (retryHint) console.log(`retry_hint: ${retryHint}`);
 
             if (!retryable) {
               console.log('⏭ 跳过重跑：last_run.retryable 不为 true（有成功/跳过项，或失败属于结构性原因）');
@@ -471,3 +530,6 @@ jobs:
             }
         env:
           RUN_RENEW_RESULT: ${{ needs.run-renew.result }}
+          # last_run 不进仓库，只能靠 job outputs 传过来
+          RETRYABLE: ${{ needs.run-renew.outputs.retryable }}
+          RETRY_HINT: ${{ needs.run-renew.outputs.retry_hint }}
