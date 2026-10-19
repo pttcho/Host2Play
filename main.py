@@ -1076,6 +1076,36 @@ def _empty_state() -> dict:
     return {"version": STATE_VERSION, "updated_at": "", "servers": {}, "last_run": {}}
 
 
+# UUID 形态（8-4-4-4-12）或长度 >= 16 的十六进制串，都当作凭据形态
+_CREDENTIAL_KEY_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+def _looks_like_credential_key(key: str) -> bool:
+    """判断 state 的 key 是否是把原始 ?i=<uuid> 直接当键的旧格式。
+
+    新格式一律是 12 位 sha1 前缀，所以只要命中 UUID 形态就一定是旧数据。
+    """
+    try:
+        return bool(_CREDENTIAL_KEY_RE.match(str(key or "").strip()))
+    except Exception:
+        return False
+
+
+def _entry_leaks_credential(entry: dict) -> bool:
+    """条目里是否存了含 ?i= 的完整链接（旧格式的 url 字段）。"""
+    try:
+        url = str(entry.get("url") or "")
+        if not url:
+            return False
+        if "i=" not in url:
+            return False
+        return bool((parse_qs(urlparse(url).query).get("i") or [""])[0])
+    except Exception:
+        return False
+
+
 def load_state(path: str = DEFAULT_STATE_FILE) -> dict:
     """读 state.json；不存在 / 损坏 / schema 不符一律降级为空 state，绝不抛异常。"""
     state = _empty_state()
@@ -1108,9 +1138,23 @@ def load_state(path: str = DEFAULT_STATE_FILE) -> dict:
         return state
 
     clean = {}
+    dropped = 0
     for key, value in servers.items():
-        if isinstance(key, str) and isinstance(value, dict):
-            clean[key] = value
+        if not (isinstance(key, str) and isinstance(value, dict)):
+            continue
+        # 迁移清理：早期版本直接把 ?i=<uuid> 当 key，并把完整 URL 存进 url 字段。
+        # 那种记录既泄露凭据，又与新的哈希 key 对不上（会成为孤儿条目）。这里
+        # 一律剔除，让下次运行按新格式重建 —— 代价只是丢一次历史，远小于继续
+        # 把凭据提交回 public 仓库。
+        if _looks_like_credential_key(key) or _entry_leaks_credential(value):
+            dropped += 1
+            continue
+        clean[key] = value
+    if dropped:
+        log(
+            f"state.json 中剔除 {dropped} 条旧格式记录（含明文凭据），将按新格式重建",
+            "WARN",
+        )
     state["servers"] = clean
 
     last_run = data.get("last_run")
