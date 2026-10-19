@@ -1255,10 +1255,16 @@ class Config:
     urls: list = field(default_factory=list)
     tg_token: str = ""
     tg_chat_id: str = ""
-    cooldown_hours: float = 6.0
-    # 剩余时间超过这个小时数就跳过。默认 2 表示"只剩 1~2 小时才动手"：
-    # 续一次通常加 24~72 小时，太早续会把已有额度浪费掉；而调度是每小时一次，
-    # 剩 2 小时意味着后面还有两次机会，单次被跳过也来得及。
+    # 冷却：成功后多久内不重复续期。默认 3h。
+    # 不能设成 6h —— 实测续期后剩 8h、阈值 2h 触发，实际间隔约 6.1h，6h 冷却
+    # 会把放行窗口压到只剩 6 分钟，一次调度延迟就会被挡住导致漏续。
+    cooldown_hours: float = 3.0
+    # 剩余时间超过这个小时数就跳过。默认 2 表示"只剩 1~2 小时才动手"。
+    #
+    # 关键前提：续期是**把 expires 重置为 now + 8h**，不是累加。
+    # 实测那次：续期前剩 6.58h，续期后剩 8.32h，净增只有 1.73h —— 因为是重置。
+    # 所以"早续"等于把剩余时间直接扔掉：剩 7h 去续，那 7h 就白费了。
+    # 配合 8h 窗口，阈值 2h 意味着实际约每 6.1h 续一次，每段额度都吃满。
     skip_remaining_hours: float = 2.0
     budget_minutes: float = 20.0
     dry_run: bool = False
@@ -1268,10 +1274,11 @@ class Config:
     ip_rotations: int = 5
     state_path: str = DEFAULT_STATE_FILE
     deadline: float = 0.0
-    # 超过这么久没成功续期就无视冷却与剩余时间阈值，强制续一次。
-    # GitHub 的 cron 在高峰期会延迟甚至整个丢弃事件，靠调度密度并不能保证每天
-    # 一定跑到；这个开关是"调度漏了也能自愈"的最后一道保险。
-    stale_after_hours: float = 30.0
+    # 超过这么久没成功续期就无视冷却与阈值，强制续一次。
+    # 必须远小于"过期到删除"的 7 天保留期，但又得大于正常的 6h 续期间隔，
+    # 否则每次正常运行都会误触发。默认 12h = 正常间隔的两倍，能容忍连续 1-2 次
+    # 调度被丢弃，又能在真正卡死时及时兜底。
+    stale_after_hours: float = 12.0
 
 
 def load_config(state_path: str = None) -> Config:
@@ -1285,7 +1292,7 @@ def load_config(state_path: str = None) -> Config:
         urls=urls,
         tg_token=_env_str("TG_BOT_TOKEN"),
         tg_chat_id=_env_str("TG_CHAT_ID"),
-        cooldown_hours=_env_float("RENEW_COOLDOWN_HOURS", 6.0),
+        cooldown_hours=_env_float("RENEW_COOLDOWN_HOURS", 3.0),
         skip_remaining_hours=_env_float("SKIP_IF_REMAINING_HOURS", 2.0),
         budget_minutes=_env_float("JOB_BUDGET_MINUTES", 20.0),
         dry_run=_env_bool("DRY_RUN", False),
@@ -1294,7 +1301,7 @@ def load_config(state_path: str = None) -> Config:
         page_attempts=_env_int("PAGE_ATTEMPTS", 6, minimum=1),
         ip_rotations=_env_int("IP_ROTATIONS", 5, minimum=0),
         state_path=state_path or _env_str("STATE_FILE", DEFAULT_STATE_FILE),
-        stale_after_hours=_env_float("STALE_AFTER_HOURS", 30.0),
+        stale_after_hours=_env_float("STALE_AFTER_HOURS", 12.0),
     )
 
 
