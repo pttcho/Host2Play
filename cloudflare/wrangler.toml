@@ -1,0 +1,23 @@
+name = "host2play-cron"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+
+# 每分钟检查一次：只花一次 getServerData 请求，不进续期窗口就不触发 Actions。
+# Cloudflare 免费计划的 cron 最小粒度就是每分钟，额度完全够用。
+[triggers]
+crons = ["* * * * *"]
+
+# 观测用：wrangler tail 可以看到每次判断的日志
+[observability]
+enabled = true
+
+# 不要在这里写密钥。用 wrangler secret put 设置：
+#   wrangler secret put GITHUB_PAT
+#   wrangler secret put GITHUB_REPO
+#   wrangler secret put RENEW_URLS
+#
+# 非密钥的调参项可以放 [vars]：
+[vars]
+GITHUB_REF = "main"
+SKIP_HOURS = "2"
+COOLDOWN_HOURS = "1"

@@ -1,30 +1,30 @@
 name: Host2Play 续期
 
 on:
-  # 调度全部用 UTC，北京时间 = UTC+8。
+  # 不再使用 GitHub 自带的 schedule 触发器。
   #
-  # 为什么改成"每小时一次"：
-  #   GitHub Actions 的 cron 在整点/半点高峰期会延迟 15~60 分钟，极端情况下整个
-  #   事件被丢弃（官方明确说明 schedule 不保证准时、高负载时会跳过）。原来的
-  #   `37 5,16` 一天只有两个点，一旦被延迟或丢弃，那个时段就没有任何替补 ——
-  #   这就是"中午那次定时器不工作"的直接原因。加密到每小时一次之后，单次被跳过
-  #   最多只影响一小时，下一小时自然会补上。
+  # 为什么弃用：实测 `17 * * * *`（每小时一次）在这台仓库上被严重限流 ——
+  #   2026-10-19 21:32 UTC 触发一次
+  #   2026-10-20 01:05 UTC 才触发下一次（间隔 3.6 小时，中间漏了 3 次）
+  # GitHub 官方也明确说明 schedule 不保证准时、高负载时会跳过，公开仓库的
+  # 高频 cron 更容易被降级。对"8 小时窗口"这种必须准点的场景不可接受。
   #
-  # 为什么每小时跑却不会每小时都续：
-  #   续不续期完全由 main.py 按"剩余时间"决定（SKIP_IF_REMAINING_HOURS），
-  #   调度只负责"多来看几眼"。剩余时间还多就直接跳过，连浏览器都不启动，
-  #   只花一次 getServerData 的 HTTP 请求（约 1 秒），不烧任何验证码额度。
+  # 现在由 Cloudflare Worker 的 Cron Trigger 每分钟检查一次，到点调用本工作流的
+  # workflow_dispatch 接口。Cloudflare 的 cron 准点率高得多，免费额度足够。
+  # 部署说明见仓库根目录 cloudflare/README.md。
   #
-  # 分钟数选 17：避开 :00 / :30 这两个排队最严重的时刻，降低被延迟的概率。
-  schedule:
-    - cron: '17 * * * *'
-
+  # 注意：workflow_dispatch 是唯一入口，所以 Cloudflare 那边必须配 GITHUB_PAT。
   workflow_dispatch:
     inputs:
       retry:
-        description: "Retry Count（内部使用，手动触发保持 0）"
+        description: "Retry Count（内部使用，保持 0）"
         required: false
         default: "0"
+        type: string
+      source:
+        description: "触发来源（cloudflare / manual）"
+        required: false
+        default: "manual"
         type: string
 
 permissions:
@@ -376,11 +376,10 @@ jobs:
                   f.write("retry_hint=" + hint.replace("\n", " ")[:200] + "\n")
           PY
 
-      # time.txt 是"仓库保活"用的：GitHub 会在仓库连续 60 天无提交时自动停用
-      # schedule 触发器。所以它必须周期性变化，否则定时器会悄悄失效。
-      # 现在每小时跑一次，如果它每次都变，就会每小时一条提交 —— 所以下面在
-      # 提交步骤里做了判断：state.json 没变化时不单独为 time.txt 造提交，
-      # 只在"距上次提交超过 3 天"时才刷一次保活提交。
+      # time.txt 记录最后一次成功运行的时间，纯人肉排查用。
+      # 注意：它不再承担"仓库保活"职责 —— 那是给 GitHub schedule 用的，而现在
+      # 定时器已经移到 Cloudflare，不存在"60 天无提交就停用"的问题了。
+      # 所以下面在提交步骤里：state.json 没变化时完全不提交，不再为时间戳造提交。
       - name: 更新时间文件
         if: always()
         run: echo "$(date -u +'%Y-%m-%d %H:%M:%S UTC')" > time.txt
@@ -414,18 +413,11 @@ jobs:
             git add -- time.txt 2>/dev/null || true
             echo "[INFO] state.json 有变化，提交状态"
           else
-            # state.json 没变 = 这一小时什么都没发生。此时不该为时间戳造提交。
-            # 但仓库连续 60 天无提交会让 GitHub 停用 schedule，所以只在距上次
-            # 提交超过 3 天时才刷一次 time.txt 做保活。
-            LAST_COMMIT_EPOCH=$(git log -1 --format=%ct 2>/dev/null || echo 0)
-            NOW_EPOCH=$(date -u +%s)
-            AGE_DAYS=$(( (NOW_EPOCH - LAST_COMMIT_EPOCH) / 86400 ))
-            if [ "$AGE_DAYS" -lt 3 ]; then
-              echo "[INFO] state.json 无变化，且距上次提交 ${AGE_DAYS} 天（<3），跳过提交"
-              exit 0
-            fi
-            echo "[INFO] state.json 无变化，但已 ${AGE_DAYS} 天无提交，刷新 time.txt 保活"
-            git add -- time.txt 2>/dev/null || true
+            # state.json 没变 = 这次运行什么都没发生（大多数情况都是跳过）。
+            # 此时不该为时间戳造提交 —— 定时器已经在 Cloudflare，不再需要
+            # "定期提交防 GitHub 停用 schedule"那套保活机制了。
+            echo "[INFO] state.json 无变化，跳过提交（不制造时间戳噪音）"
+            exit 0
           fi
 
           if git diff --cached --quiet; then

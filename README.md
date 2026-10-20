@@ -77,33 +77,56 @@ https://host2play.gratis/server/renew?i=你的服务器ID
 
 ## 🚀 使用方法
 
-### 方法 1：定时自动运行（默认）
+### 方法 1：Cloudflare 定时器（推荐，默认架构）
 
-Fork 本仓库并完成上述配置后，工作流**每小时运行一次**：
+**GitHub 自带的 `schedule` 不可靠，已经弃用。** 实测证据：
 
-- `17 * * * *` → 每小时的第 17 分钟（UTC），即北京时间每小时 17 分
+```
+配置 cron: '17 * * * *'（每小时一次）
+实际触发：
+  2026-10-19 21:32 UTC
+  2026-10-20 01:05 UTC   ← 间隔 3.6 小时，中间漏了 3 次
+```
 
-**但每小时运行 ≠ 每小时续期。** 续不续期完全由「剩余时间」决定：
+GitHub 官方也写明 `schedule` 不保证准时、高负载时事件会被丢弃。而续期后只有 8 小时窗口，漏 3 次就过期了。
+
+改用 Cloudflare Worker 的 Cron Trigger 来敲门：
+
+| 谁 | 做什么 | 频率 |
+|---|---|---|
+| **Cloudflare Worker** | 读 `getServerData`，判断剩余是否 ≤ 2h；到点才调 GitHub | 每分钟（每次几毫秒） |
+| **GitHub Actions** | 真正续期：起 Chrome、解 reCAPTCHA、提交 | 只在需要时（约每 6h 一次） |
+
+这样 99% 的分钟只花一次 HTTP 请求，不进续期窗口就完全不碰 Actions。
+
+部署步骤见 [cloudflare/README.md](cloudflare/README.md)，核心就四步：
+
+```bash
+cd cloudflare
+wrangler secret put GITHUB_PAT      # Fine-grained PAT，只需 Actions: read+write
+wrangler secret put GITHUB_REPO     # pttcho/Host2Play
+wrangler secret put RENEW_URLS      # 续期链接
+wrangler deploy
+```
+
+部署后验证：
+
+```bash
+curl https://host2play-cron.<你的子域>.workers.dev/probe   # 看剩余时间，不触发
+curl https://host2play-cron.<你的子域>.workers.dev/trigger # 手动强推一次
+wrangler tail                                              # 看实时判断日志
+```
+
+**续不续期仍由剩余时间决定**，与调度频率无关：
 
 | 剩余时间 | 行为 | 开销 |
 |---|---|---|
-| > 2 小时 | 跳过，不启动浏览器 | 一次 HTTP 请求（约 1 秒） |
-| ≤ 2 小时 | 续期 | 启动 Chrome + 解验证码，约 1–3 分钟 |
+| > 2 小时 | 跳过，连 Actions 都不触发 | Worker 一次 HTTP 请求 |
+| ≤ 2 小时 | 触发 Actions 续期 | 约 1–9 分钟 |
 | 已过期（7 天内） | **立即续期**，不受冷却限制 | 同上 |
 | 已过期超 7 天 | 判为终态，不再重试 | 一次 HTTP 请求 |
 
-之所以敢每小时跑：跳过路径**连浏览器都不启动**，只调一次 `getServerData` 接口拿剩余时间，完全不消耗验证码额度。
-
-之所以必须每小时跑：GitHub Actions 的 cron 在整点/半点高峰期会延迟 15–60 分钟，极端情况下整个事件被丢弃。原来一天只有 2–5 个调度点，某个点被跳过就没有替补 —— 这正是"中午那次定时器不工作"的原因。加密到每小时之后，单次被跳过最多影响一小时。
-
-> 分钟数选 `17` 而不是 `0`：整点和半点是 Actions 排队最严重的时刻，避开能显著降低延迟概率。
-
-如需修改频率，编辑 `.github/workflows/Host2Play_Renew.yml` 中的 `schedule` 部分。常用示例：
-- `17 * * * *`  每小时一次（默认，推荐）
-- `17 */2 * * *` 每 2 小时一次（更省 Actions 分钟数，但容错窗口变小）
-- `17 3,11,19 * * *` 每天 3 次（北京 11:17 / 19:17 / 次日 03:17）
-
-> ⚠️ 不建议把频率降到每天 1–2 次：调度一旦被 GitHub 延迟或丢弃，就正好赶上服务器过期。省下的那点 Actions 分钟数，不值得拿服务器去赌。
+> 想调阈值就改 `cloudflare/wrangler.toml` 的 `SKIP_HOURS`，并保证与 Actions 里的 `SKIP_IF_REMAINING_HOURS` 一致，否则两边判断会打架。
 
 ### 方法 2：手动触发（GitHub 网页）
 
