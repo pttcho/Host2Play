@@ -9,10 +9,20 @@ compatibility_date = "2026-10-01"
 # 如果你也想让默认子域可用，去 Dashboard → Workers → 该 Worker → Settings →
 # Domains & Routes 里把 workers.dev 那条重新启用一次。
 
-# 每分钟检查一次：只花一次 getServerData 请求，不进续期窗口就不触发 Actions。
-# Cloudflare 免费计划的 cron 最小粒度就是每分钟，额度完全够用。
+# 每 10 分钟检查一次。
+#
+# 为什么不每分钟：每分钟 = 1440 次/天，每次都要调一次 host2play 的
+# /publicapis/getServerData。Cloudflare 那边额度完全不是问题（1.44%），但这是
+# 在持续敲别人的服务器，1440 次/天属于滥用，也可能触发 Cloudflare 侧的速率限制。
+#
+# 为什么 10 分钟够安全：阈值 SKIP_HOURS=2，即剩余降到 2h 才续期。
+# 检查间隔决定"最晚多久发现"：
+#   10 分钟 -> 最坏发现时还剩 1.83h，距过期仍有余量
+#   30 分钟 -> 最坏还剩 1.50h
+#   60 分钟 -> 最坏还剩 1.00h（余量偏薄，一旦 Actions 排队就危险）
+# 10 分钟把请求量降到 144 次/天，同时保留近 2 小时容错，是平衡点。
 [triggers]
-crons = ["* * * * *"]
+crons = ["*/10 * * * *"]
 
 # 观测用：wrangler tail 可以看到每次判断的日志
 [observability]
@@ -27,4 +37,15 @@ enabled = true
 [vars]
 GITHUB_REF = "main"
 SKIP_HOURS = "2"
-COOLDOWN_HOURS = "1"
+
+# 触发冷却：防止 10 分钟一次的检查反复拉起 Actions。
+#
+# 设 0.33h（约 20 分钟）而不是 1h：
+#   冷却必须 > 检查间隔（10 分钟），否则每次检查都会重复触发；
+#   但也不能太大 —— 窗口只有 2 小时，若首次触发后 Actions 失败（验证码没解出来、
+#   IP 被 Google 封等），需要尽快重试。1 小时冷却会吃掉半个容错窗口，
+#   只剩 1 次重试机会；20 分钟则能在 2 小时内重试约 6 次。
+#
+# 另外 Actions 侧还有 RENEW_COOLDOWN_HOURS=3 和 concurrency 组兜底，
+# 即使这里触发得勤一点，也不会真的重复续期。
+COOLDOWN_HOURS = "0.33"

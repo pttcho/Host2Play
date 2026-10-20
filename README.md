@@ -94,10 +94,12 @@ GitHub 官方也写明 `schedule` 不保证准时、高负载时事件会被丢�
 
 | 谁 | 做什么 | 频率 |
 |---|---|---|
-| **Cloudflare Worker** | 读 `getServerData`，判断剩余是否 ≤ 2h；到点才调 GitHub | 每分钟（每次几毫秒） |
+| **Cloudflare Worker** | 读 `getServerData`，判断剩余是否 ≤ 2h；到点才调 GitHub | 每 10 分钟（144 次/天） |
 | **GitHub Actions** | 真正续期：起 Chrome、解 reCAPTCHA、提交 | 只在需要时（约每 6h 一次） |
 
-这样 99% 的分钟只花一次 HTTP 请求，不进续期窗口就完全不碰 Actions。
+这样绝大多数检查只花一次 HTTP 请求，不进续期窗口就完全不碰 Actions。
+
+> 为什么不是每分钟：额度不是瓶颈，但每分钟 = 1440 次/天持续敲 host2play 的接口，属于滥用。10 分钟已足够安全 —— 阈值 2h，最坏也在还剩 1.83h 时发现。
 
 部署步骤见 [cloudflare/README.md](cloudflare/README.md)，核心就四步：
 
