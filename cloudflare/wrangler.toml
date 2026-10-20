@@ -2,6 +2,13 @@ name = "host2play-cron"
 main = "worker.js"
 compatibility_date = "2026-10-01"
 
+# 注意：访问入口是自定义域名 host2play-cron.pzz.kdns.fr（在 Dashboard 里
+# 用 Custom Domain 绑的，不在这个文件里配）。
+# 默认的 <name>.<subdomain>.workers.dev 实测返回 500 / error 1101（路由未激活），
+# 但 cron 触发走 Worker 内部调用、不依赖 HTTP 域名，所以不影响续期。
+# 如果你也想让默认子域可用，去 Dashboard → Workers → 该 Worker → Settings →
+# Domains & Routes 里把 workers.dev 那条重新启用一次。
+
 # 每分钟检查一次：只花一次 getServerData 请求，不进续期窗口就不触发 Actions。
 # Cloudflare 免费计划的 cron 最小粒度就是每分钟，额度完全够用。
 [triggers]
