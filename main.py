@@ -320,6 +320,12 @@ STATE_VERSION = 1
 DEFAULT_STATE_FILE = "state.json"
 SCREENSHOT_DIR = "output/screenshots"
 
+# 北京时间固定 UTC+8，无夏令时。两处用途，互不干扰：
+#   1. 展示层：Telegram 文案按北京时间显示（_fmt_bj）；
+#   2. 解析层：站点页面上的 #deleteDate 是北京时间，解析时按这个时区解释。
+# 内部存储与比较一律 UTC —— API 返回的就是 UTC 时间戳，混用会引入 8 小时偏差。
+BJ_TZ = timezone(timedelta(hours=8))
+
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -411,10 +417,20 @@ def _strip_expiry_prefix(text: str) -> str:
     return stripped or text.strip()
 
 
-def _parse_absolute(text: str):
+def _parse_absolute(text: str, tz=timezone.utc):
+    """解析绝对时间文本。tz 用于解释**无时区信息**的裸时间。
+
+    为什么要这个参数：站点页面上的 `#deleteDate` 是北京时间
+    （实测页面 `2026/10/26 22:34:55` = API 的 `2026-10-26 14:34:55 UTC`），
+    而 API 时间戳换算出来是 UTC。若把页面文本一律按 UTC 解释，
+    DOM 路径的到期时间会偏差 8 小时 —— 足以让"续期成功"被误判成失败。
+    """
     cand = text.strip()
     if not cand:
         return None
+    # 兼容我们自己写进 state 的 "2026-10-26 14:34:55 UTC" 形式
+    if cand.upper().endswith(" UTC"):
+        cand = cand[:-4].strip() + "+00:00"
     if cand[-1] in ("Z", "z") and len(cand) > 10:
         cand = cand[:-1] + "+00:00"
     try:
@@ -423,9 +439,13 @@ def _parse_absolute(text: str):
         pass
     for fmt in _ABS_FORMATS:
         try:
-            return _to_utc(datetime.strptime(cand, fmt))
+            parsed = datetime.strptime(cand, fmt)
         except Exception:
             continue
+        # strptime 出来的都是 naive，按调用方给的时区解释，再统一转 UTC
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=tz)
+        return _to_utc(parsed)
     return None
 
 
@@ -448,8 +468,8 @@ def _parse_relative(text: str):
     return datetime.now(timezone.utc) + timedelta(seconds=total)
 
 
-def parse_expiry(text):
-    """把页面上的到期文案解析成 UTC aware datetime，无法解析返回 None。
+def parse_expiry(text, tz=timezone.utc):
+    """把到期文案解析成 UTC aware datetime，无法解析返回 None。
 
     支持 "Expires in: 2 days" / "Expires in: 23 hours 30 minutes" /
     "Deletes on: 2026-10-17 20:19:49" / "2026-10-17T20:19:49Z" /
@@ -457,6 +477,10 @@ def parse_expiry(text):
 
     注意 "Expires in: 06:39:55" 这类倒计时返回 None —— 它是时钟不是日期，把它当
     到期时间做比较正是旧实现误判的根源。绝对时间请用 parse_ts()。
+
+    `tz` 只影响**无时区信息的裸时间**如何解释。默认 UTC；解析站点页面文本时
+    传 BJ_TZ，因为页面的 `#deleteDate` 是北京时间（实测已核对）。
+    带 Z / +08:00 / " UTC" 后缀的文本不受影响。
     """
     try:
         if text is None:
@@ -482,7 +506,7 @@ def parse_expiry(text):
             return None
         if _COUNTDOWN_RE.match(candidate):
             return None
-        absolute = _parse_absolute(candidate)
+        absolute = _parse_absolute(candidate, tz)
         if absolute is not None:
             return absolute
         return _parse_relative(candidate)
@@ -812,12 +836,17 @@ def _mask_url(url: str) -> str:
 
 
 def build_caption(ok, server_name, url, old_expiry, new_expiry, reason="", skipped=False):
-    """生成 Telegram 文案。纯文本，不带任何 HTML 标签，避免 parse_mode 转义问题。"""
+    """生成 Telegram 文案。纯文本，不带任何 HTML 标签，避免 parse_mode 转义问题。
+
+    所有时间按**北京时间**显示：内部判定用 UTC，但给人看的这一层换成 UTC+8，
+    省得每次收到通知还要自己加 8 小时。
+    """
     name = _plain((server_name or "").strip() or "未知")
-    old = _plain((old_expiry or "").strip() or "未知")
-    new = _plain((new_expiry or "").strip() or "未知")
+    old = _plain(_reformat_for_tg(old_expiry) or "未知")
+    new = _plain(_reformat_for_tg(new_expiry) or "未知")
     link = _plain(_mask_url(url))
     why = _plain((reason or "").strip())
+    stamp = _plain(_fmt_bj(datetime.now(timezone.utc)))
 
     lines = []
     if skipped:
@@ -836,6 +865,8 @@ def build_caption(ok, server_name, url, old_expiry, new_expiry, reason="", skipp
         lines.append(f"服务器: {name}")
         lines.append(f"原因: {why or '未知'}")
         lines.append(f"URL: {link}")
+    lines.append("")
+    lines.append(f"时间: {stamp}")
     return "\n".join(lines)
 
 
@@ -847,9 +878,40 @@ def _now_iso() -> str:
 
 
 def _fmt_dt(value) -> str:
+    """内部时间展示（日志 / 自检 / state 兜底），统一用 UTC，便于和 API 原始值对照。"""
     if isinstance(value, datetime):
         return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     return ""
+
+
+def _fmt_bj(value) -> str:
+    """Telegram 文案专用：转成北京时间显示。
+
+    内部一律用 UTC 存储和比较（API 时间戳就是 UTC），只在**给人看的那一层**
+    转时区。这样既不会因为时区换算污染判定逻辑，又不用让收通知的人自己做加法。
+    """
+    if isinstance(value, datetime):
+        return value.astimezone(BJ_TZ).strftime("%Y-%m-%d %H:%M:%S (UTC+8)")
+    return ""
+
+
+def _reformat_for_tg(text: str) -> str:
+    """把已经是 "YYYY-MM-DD HH:MM:SS UTC" 的字符串就地转成北京时间。
+
+    文案里的 old/new 到期值来源不统一：API 路径是 `_fmt_dt` 产出的 UTC 串，
+    DOM 路径可能是页面原文（本身就是北京时间）。这里只处理**明确带 UTC 后缀**
+    的串，其余原样透传，避免对页面原文重复加 8 小时。
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    parsed = parse_expiry(raw)  # 已支持 " UTC" 后缀
+    if parsed is None:
+        return raw
+    if "UTC" not in raw.upper():
+        # 不带时区标记的串（多半是页面原文），按北京时间处理，不再二次换算
+        return raw
+    return _fmt_bj(parsed)
 
 
 def wait_for(pred, timeout=10.0, interval=0.4):
@@ -1545,9 +1607,12 @@ def read_expiry_raw(page) -> str:
     优先级：绝对时间（Deletes on / #deleteDate）> "Server expired" 标记。
     倒计时（06:35:12）直接丢弃返回空串 —— 它每 500ms 变一次，存进 state 或拿来做
     前后比较都会立刻失效，旧实现误判成功正是因为它把倒计时当成了到期时间。
+
+    注意页面时间是**北京时间**（实测 `#deleteDate` = API 的 deletes + 8h），
+    所以这里用 BJ_TZ 解析，否则到期时间会整体偏差 8 小时。
     """
     absolute = extract_expiry_text(ele_text(page, SELECTORS["delete_date"], 1.0))
-    if absolute and parse_expiry(absolute) is not None:
+    if absolute and parse_expiry(absolute, BJ_TZ) is not None:
         return absolute
 
     raw = extract_expiry_text(ele_text(page, SELECTORS["expiry"], 1.0))
@@ -2687,7 +2752,7 @@ def run_renew_attempt_dom(page, url: str, cfg: Config, precheck) -> dict:
         "name": read_server_name(page),
         "old_raw": old_raw,
         "new_raw": "",
-        "expires_dt": parse_expiry(old_raw),
+        "expires_dt": parse_expiry(old_raw, BJ_TZ),
     }
     if not result["old_raw"]:
         result["status"] = "structural"
@@ -2715,7 +2780,7 @@ def run_renew_attempt_dom(page, url: str, cfg: Config, precheck) -> dict:
     if not wait_for(lambda: find_frame(page, "anchor"), 25):
         ok, new_raw = _detect_success_dom(page, result["expires_dt"], result["old_raw"])
         result["new_raw"] = new_raw
-        result["expires_dt"] = parse_expiry(new_raw) or result["expires_dt"]
+        result["expires_dt"] = parse_expiry(new_raw, BJ_TZ) or result["expires_dt"]
         if ok:
             result["status"] = "success"
             result["detail"] = "未出现验证码，页面已显示续期成功"
@@ -2741,7 +2806,7 @@ def run_renew_attempt_dom(page, url: str, cfg: Config, precheck) -> dict:
 
     ok, new_raw = _detect_success_dom(page, result["expires_dt"], result["old_raw"])
     result["new_raw"] = new_raw
-    new_dt = parse_expiry(new_raw)
+    new_dt = parse_expiry(new_raw, BJ_TZ)
     if new_dt is not None:
         result["expires_dt"] = new_dt
     if ok:
@@ -2770,7 +2835,7 @@ def _detect_success_dom(page, old_dt, old_raw=""):
         pass
     new_raw = read_expiry_raw(page)
 
-    new_dt = parse_expiry(new_raw) if new_raw else None
+    new_dt = parse_expiry(new_raw, BJ_TZ) if new_raw else None
 
     # 过期起点：old_dt 为 None 但 old_raw 明确是过期标记。
     # 续期成功后页面会显示新的绝对时间，"Server expired" 消失即为成功。
@@ -2844,7 +2909,8 @@ def _apply_result(state: dict, lock, result: UrlResult, cfg: Config) -> None:
         if isinstance(result.expires_dt, datetime):
             entry["expiry_iso"] = _to_utc(result.expires_dt).isoformat(timespec="seconds")
         elif not entry.get("expiry_iso"):
-            parsed_old = parse_expiry(result.old_raw) if result.old_raw else None
+            # old_raw 可能来自页面（北京时间），也可能来自 _fmt_dt（带 UTC 后缀）
+            parsed_old = parse_expiry(result.old_raw, BJ_TZ) if result.old_raw else None
             if parsed_old is not None:
                 entry["expiry_iso"] = parsed_old.isoformat(timespec="seconds")
 

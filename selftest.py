@@ -652,6 +652,102 @@ class ShouldSkipTests(unittest.TestCase):
 
 
 # ==============================================================================
+# 时区：内部 UTC 存储，Telegram 文案按北京时间显示
+# ==============================================================================
+class TimezoneTests(unittest.TestCase):
+    """测北京时间语义：页面文本按 BJ_TZ 解析、文案按 BJ_TZ 显示、不重复换算。
+
+    背景：站点页面 #deleteDate 是北京时间（实测 2026/10/26 22:34:55 =
+    API 的 2026-10-26 14:34:55 UTC），而 API 时间戳是 UTC。混用会引入 8 小时偏差。
+    """
+
+    def setUp(self):
+        self.bj = getattr(main, "BJ_TZ", None)
+        if self.bj is None:
+            self.skipTest("main.BJ_TZ 不存在")
+        self.parse_expiry = require_function(self, "parse_expiry")
+        self.fmt_bj = require_function(self, "_fmt_bj")
+        self.reformat = require_function(self, "_reformat_for_tg")
+
+    def test_bj_tz_is_utc_plus_8(self):
+        """BJ_TZ 必须是固定 UTC+8（中国无夏令时）。"""
+        self.assertEqual(
+            self.bj.utcoffset(None).total_seconds(), 8 * 3600,
+            "BJ_TZ 偏移是 %r，期望 +8 小时" % (self.bj.utcoffset(None),),
+        )
+
+    def test_page_text_parsed_as_beijing(self):
+        """页面文本按 BJ_TZ 解析后应等于 API 真值（偏差 0）。"""
+        page_text = "2026/10/26 22:34:55"
+        api_utc = datetime(2026, 10, 26, 14, 34, 55, tzinfo=timezone.utc)
+        got = self.parse_expiry(page_text, self.bj)
+        self.assertIsNotNone(got, "parse_expiry(%r, BJ_TZ) 返回 None" % page_text)
+        self.assertEqual(
+            got, api_utc,
+            "页面文本 %r 按北京时间解析得到 %r，期望 %r（差 %s 小时）"
+            % (page_text, got, api_utc, (got - api_utc).total_seconds() / 3600
+               if got else "?"),
+        )
+
+    def test_page_text_wrong_when_parsed_as_utc(self):
+        """反证：按 UTC 解析会偏差 8 小时——这正是要修的 bug。"""
+        page_text = "2026/10/26 22:34:55"
+        api_utc = datetime(2026, 10, 26, 14, 34, 55, tzinfo=timezone.utc)
+        wrong = self.parse_expiry(page_text)  # 默认 UTC
+        drift = (wrong - api_utc).total_seconds() / 3600
+        self.assertAlmostEqual(
+            drift, 8.0, places=2,
+            msg="按 UTC 解析的偏差是 %.2fh，期望 8h（说明默认时区语义变了）" % drift,
+        )
+
+    def test_explicit_tz_suffix_ignores_tz_param(self):
+        """带 Z / +08:00 / " UTC" 后缀的文本不受 tz 参数影响。"""
+        expected = datetime(2026, 10, 26, 14, 34, 55, tzinfo=timezone.utc)
+        for text in (
+            "2026-10-26T14:34:55Z",
+            "2026-10-26T14:34:55+00:00",
+            "2026-10-26 14:34:55 UTC",
+        ):
+            with self.subTest(text=text):
+                got = self.parse_expiry(text, self.bj)
+                self.assertEqual(
+                    got, expected,
+                    "%r 带明确时区，不该被 BJ_TZ 再偏移，得到 %r" % (text, got),
+                )
+
+    def test_fmt_bj_converts_utc_to_beijing(self):
+        """_fmt_bj 把 UTC 转成北京时间并标注 UTC+8。"""
+        utc = datetime(2026, 10, 20, 15, 16, 29, tzinfo=timezone.utc)
+        out = self.fmt_bj(utc)
+        self.assertIn("2026-10-20 23:16:29", out, "_fmt_bj 输出 %r 不含北京时刻" % out)
+        self.assertIn("UTC+8", out, "_fmt_bj 输出 %r 未标注 UTC+8" % out)
+
+    def test_reformat_utc_suffix_converted(self):
+        """带 UTC 后缀的串 -> 转成北京时间。"""
+        out = self.reformat("2026-10-20 15:16:29 UTC")
+        self.assertIn("2026-10-20 23:16:29", out, "UTC 串未转成北京时间: %r" % out)
+
+    def test_reformat_plain_text_untouched(self):
+        """不带时区标记的页面原文原样透传，不重复加 8 小时。"""
+        raw = "2026/10/27 15:16:29"
+        out = self.reformat(raw)
+        self.assertEqual(
+            out, raw,
+            "页面原文 %r 被改动为 %r —— 会重复加 8 小时" % (raw, out),
+        )
+
+    def test_caption_shows_beijing_time(self):
+        """端到端：文案里的到期时间应是北京时间，不是 UTC。"""
+        build = require_function(self, "build_caption")
+        caption = build(
+            True, "srv", "https://host2play.gratis/server/renew?i=x",
+            "2026-10-20 15:16:29 UTC", "2026-10-20 16:16:29 UTC",
+        )
+        self.assertIn("23:16:29", caption, "文案未显示北京到期时间：\n%s" % caption)
+        self.assertNotIn(" 15:16:29 UTC", caption, "文案仍残留 UTC 时间：\n%s" % caption)
+
+
+# ==============================================================================
 # build_caption
 # ==============================================================================
 class BuildCaptionTests(unittest.TestCase):
