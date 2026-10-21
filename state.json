@@ -6,12 +6,12 @@
       "expiry_raw": "2026-10-21 03:39:48 UTC",
       "host": "host2play.gratis",
       "last_attempt_at": "2026-10-20T19:39:51+00:00",
-      "last_reason": "服务端 success=1；到期时间已增长",
-      "last_status": "success",
+      "last_reason": "剩余 2.5h 已超过阈值 2h",
+      "last_status": "skipped",
       "last_success_at": "2026-10-20T19:39:51+00:00",
       "name": "fvf8042"
     }
   },
-  "updated_at": "2026-10-20T19:39:51+00:00",
+  "updated_at": "2026-10-21T01:11:53+00:00",
   "version": 1
 }
