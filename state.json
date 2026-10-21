@@ -1,17 +1,17 @@
 {
   "servers": {
     "082dfb9b6753": {
-      "consecutive_failures": 6,
+      "consecutive_failures": 7,
       "expiry_iso": "2026-10-22T05:17:51+00:00",
       "expiry_raw": "2026-10-22 05:17:51 UTC",
       "host": "host2play.gratis",
-      "last_attempt_at": "2026-10-21T22:09:26+00:00",
+      "last_attempt_at": "2026-10-21T22:14:46+00:00",
       "last_reason": "页面缺少 csrf-token meta（站点可能改版）",
       "last_status": "failed",
       "last_success_at": "2026-10-21T21:17:55+00:00",
       "name": "fvf8042"
     }
   },
-  "updated_at": "2026-10-21T22:09:26+00:00",
+  "updated_at": "2026-10-21T22:14:46+00:00",
   "version": 1
 }
