@@ -6,12 +6,12 @@
       "expiry_raw": "2026-10-21 22:02:29 UTC",
       "host": "host2play.gratis",
       "last_attempt_at": "2026-10-21T19:34:56+00:00",
-      "last_reason": "页面缺少 csrf-token meta（站点可能改版）",
-      "last_status": "failed",
+      "last_reason": "剩余 2.3h 已超过阈值 2h",
+      "last_status": "skipped",
       "last_success_at": "2026-10-21T14:02:32+00:00",
       "name": "fvf8042"
     }
   },
-  "updated_at": "2026-10-21T19:34:56+00:00",
+  "updated_at": "2026-10-21T19:43:28+00:00",
   "version": 1
 }
