@@ -1,17 +1,17 @@
 {
   "servers": {
     "082dfb9b6753": {
-      "consecutive_failures": 9,
-      "expiry_iso": "2026-10-22T05:17:51+00:00",
-      "expiry_raw": "2026-10-22 05:17:51 UTC",
+      "consecutive_failures": 0,
+      "expiry_iso": "2026-10-22T11:22:54+00:00",
+      "expiry_raw": "2026-10-22 11:22:54 UTC",
       "host": "host2play.gratis",
-      "last_attempt_at": "2026-10-21T22:31:39+00:00",
-      "last_reason": "剩余 6.7h 已超过阈值 2h",
-      "last_status": "skipped",
-      "last_success_at": "2026-10-21T21:17:55+00:00",
+      "last_attempt_at": "2026-10-22T03:22:59+00:00",
+      "last_reason": "服务端 success=1；到期时间已增长",
+      "last_status": "success",
+      "last_success_at": "2026-10-22T03:22:59+00:00",
       "name": "fvf8042"
     }
   },
-  "updated_at": "2026-10-21T22:33:16+00:00",
+  "updated_at": "2026-10-22T03:22:59+00:00",
   "version": 1
 }
