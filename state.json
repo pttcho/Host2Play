@@ -1,17 +1,17 @@
 {
   "servers": {
     "082dfb9b6753": {
-      "consecutive_failures": 2,
+      "consecutive_failures": 3,
       "expiry_iso": "2026-11-09T13:38:01+00:00",
       "expiry_raw": "2026-11-09 13:38:01 UTC",
       "host": "host2play.gratis",
-      "last_attempt_at": "2026-11-09T11:55:14+00:00",
-      "last_reason": "第 8 次识别不出内容",
+      "last_attempt_at": "2026-11-09T12:07:56+00:00",
+      "last_reason": "切换音频模式时检测到封锁提示；IP 轮换次数已用尽",
       "last_status": "failed",
       "last_success_at": "2026-11-09T05:38:04+00:00",
       "name": "fvf8042"
     }
   },
-  "updated_at": "2026-11-09T11:55:14+00:00",
+  "updated_at": "2026-11-09T12:07:56+00:00",
   "version": 1
 }
